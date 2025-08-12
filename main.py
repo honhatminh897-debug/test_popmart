@@ -36,12 +36,15 @@ CAPTCHA_SOFT_TIMEOUT = int(os.getenv("CAPTCHA_SOFT_TIMEOUT", "120"))
 CAPTCHA_POLL_INTERVAL = int(os.getenv("CAPTCHA_POLL_INTERVAL", "5"))
 CAPTCHA_MAX_TRIES = int(os.getenv("CAPTCHA_MAX_TRIES", "4"))
 
-# Anti-dup day registry
+# Cho phép chạy lại cùng ngày ở lần upload sau (mặc định: cho phép)
+DISABLE_GLOBAL_DAY_DEDUP = os.getenv("DISABLE_GLOBAL_DAY_DEDUP", "1").strip() == "1"
+
+# Anti-dup theo phiên đang chạy trong cùng thời điểm
 ACTIVE_DAYS = set()
 COMPLETED_DAYS = set()
 ACTIVE_LOCK = threading.Lock()
 
-# Pending manual captcha (if not using 2Captcha)
+# Pending manual captcha (nếu không dùng 2Captcha)
 PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
 
@@ -293,8 +296,10 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days_to_run = []
     with ACTIVE_LOCK:
         for d in unique_days:
-            if d in ACTIVE_DAYS or d in COMPLETED_DAYS:
-                continue
+            if d in ACTIVE_DAYS:
+                continue  # đang chạy ở 1 tác vụ khác
+            if (not DISABLE_GLOBAL_DAY_DEDUP) and (d in COMPLETED_DAYS):
+                continue  # chỉ chặn nếu bật dedup toàn cục
             ACTIVE_DAYS.add(d)
             days_to_run.append(d)
 
@@ -413,7 +418,9 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         finally:
             with ACTIVE_LOCK:
                 ACTIVE_DAYS.discard(day)
-                COMPLETED_DAYS.add(day)
+                # Chỉ đánh dấu COMPLETED khi BẬT dedup toàn cục
+                if not DISABLE_GLOBAL_DAY_DEDUP:
+                    COMPLETED_DAYS.add(day)
 
     # tạo task asyncio cho mỗi ngày
     tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
