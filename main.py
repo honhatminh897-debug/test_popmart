@@ -1,8 +1,8 @@
 import os
 import io
+import asyncio
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("popmart-bot")
 
 # ===== Config =====
-# 👉 BASE_URL có thể là root (vd https://your-app) hoặc đã kèm đường dẫn (vd https://your-app/popmart)
+# BASE_URL có thể là root (vd https://your-app) hoặc đã kèm /popmart (vd https://your-app/popmart)
 BASE_URL = os.getenv("BASE_URL", "https://clone-popmart-production.up.railway.app").rstrip("/")
 POP_PAGE_PATH = os.getenv("POP_PAGE_PATH", "/popmart").strip() or "/popmart"
 AJAX_PATH = os.getenv("AJAX_PATH", "/Ajax.aspx").strip() or "/Ajax.aspx"
@@ -48,31 +48,33 @@ PENDING_LOCK = threading.Lock()
 def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
     """
     Từ BASE_URL (root hoặc đã kèm /popmart) => tính:
-      - page_url: URL trang form (/popmart)
-      - ajax_url: URL Ajax "chuẩn" ở root (/Ajax.aspx)
-      - ajax_alt_url: Ajax fallback nằm cùng thư mục với page (/popmart/Ajax.aspx)
+      - page_url: URL trang form (…/popmart)
+      - ajax_url: URL Ajax ở "root" (…/Ajax.aspx)
+      - ajax_alt_url: Ajax fallback nằm cùng thư mục với page (…/popmart/Ajax.aspx)
     """
     sp = urlsplit(base_url)
-    # Chuẩn hóa path
     base_path = sp.path.rstrip("/")
+
     pop_path = "/" + pop_path.lstrip("/")
     ajax_path = "/" + ajax_path.lstrip("/")
 
-    # Nếu BASE_URL đã kết thúc bằng POP_PAGE_PATH -> coi đó là page_url
-    if base_path.endswith(pop_path):
-        root_path = base_path[: -len(pop_path)] or ""
-        page_url = urlunsplit((sp.scheme, sp.netloc, base_path or "/", "", ""))
-        root_base = urlunsplit((sp.scheme, sp.netloc, root_path or "/", "", ""))
-    else:
-        # BASE_URL là root/subdir, ghép thêm pop path
-        root_base = urlunsplit((sp.scheme, sp.netloc, base_path or "/", "", ""))
-        page_url = urlunsplit((sp.scheme, sp.netloc, (base_path + pop_path) or "/", "", ""))
+    ends_with_pop = base_path.endswith(pop_path)
+    # path của page
+    page_path = base_path if ends_with_pop else (base_path + pop_path)
+    if not page_path.startswith("/"):
+        page_path = "/" + page_path
 
-    ajax_url = urlunsplit((sp.scheme, sp.netloc, (root_base.rstrip("/").split(sp.netloc, 1)[-1] or "/").rstrip("/") + ajax_path, "", "")) \
-        if root_base.startswith(f"{sp.scheme}://{sp.netloc}") else f"{root_base.rstrip('/')}{ajax_path}"
-    # Fallback Ajax cùng thư mục với page
-    page_dir = page_url.rsplit("/", 1)[0]
-    ajax_alt_url = f"{page_dir}{ajax_path}"
+    # root_path (thư mục cha của page)
+    root_path = base_path[:-len(pop_path)] if ends_with_pop else base_path
+    if not root_path:
+        root_path = "/"
+    if not root_path.startswith("/"):
+        root_path = "/" + root_path
+
+    page_url = urlunsplit((sp.scheme, sp.netloc, page_path, "", ""))
+    ajax_url = urlunsplit((sp.scheme, sp.netloc, (root_path.rstrip("/") + ajax_path), "", ""))
+    page_dir = page_path.rsplit("/", 1)[0] or "/"
+    ajax_alt_url = urlunsplit((sp.scheme, sp.netloc, (page_dir + ajax_path), "", ""))
 
     return page_url, ajax_url, ajax_alt_url
 
@@ -95,7 +97,6 @@ class PopmartClient:
         return r.text
 
     def _ajax_get(self, params: Dict[str, str]) -> requests.Response:
-        # Thử ajax_url trước, nếu 404 thì thử ajax_alt_url
         r = self.session.get(self.ajax_url, params=params, timeout=self.timeout, allow_redirects=True)
         if r.status_code == 404:
             r2 = self.session.get(self.ajax_alt_url, params=params, timeout=self.timeout, allow_redirects=True)
@@ -121,7 +122,6 @@ class PopmartClient:
             src = img["src"].strip()
             if src.startswith("http"):
                 return src
-            # Ảnh captcha thường là đường dẫn root; ghép với root của ajax_url
             root = self.ajax_url.rsplit("/", 1)[0]
             return f"{root}/{src.lstrip('./')}"
         return None
@@ -157,7 +157,7 @@ def extract_all_sales_dates(html: str) -> List[str]:
     for opt in sel.find_all("option"):
         txt = (opt.text or "").strip()
         val = (opt.get("value") or "").strip()
-        if txt and val:  # skip placeholder
+        if txt and val:
             out.append(txt)
     return out
 
@@ -256,7 +256,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = PopmartClient(BASE_URL, POP_PAGE_PATH, AJAX_PATH, REQUEST_TIMEOUT)
 
     # Sales dates
-    main_html = client.get_main_page()
+    main_html = await asyncio.to_thread(client.get_main_page)
     all_days = extract_all_sales_dates(main_html)
     if not all_days:
         await update.message.reply_text("Không tìm thấy Sales Dates trên form.")
@@ -277,20 +277,20 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     max_workers = min(len(days_to_run), MAX_WORKERS_CAP if MAX_WORKERS_CAP > 0 else len(days_to_run))
-    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Chạy tối đa {max_workers} luồng (mỗi ngày 1 luồng).")
+    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Sẽ tạo {max_workers} task (mỗi ngày 1 task).")
 
     # Each day -> all rows
     buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
 
     async def process_day(day: str, tasks: List[Dict[str, Any]]):
         try:
-            html = client.get_main_page()
+            html = await asyncio.to_thread(client.get_main_page)
             id_ngay = client.map_sales_date_to_id(html, day)
             if not id_ngay:
                 await update.message.reply_text(f"[{day}] Không tìm thấy idNgàyBanHang.")
                 return
 
-            sessions = client.load_sessions_for_day(id_ngay)
+            sessions = await asyncio.to_thread(client.load_sessions_for_day, id_ngay)
             if not sessions:
                 await update.message.reply_text(f"[{day}] Không có phiên để đăng ký. Bỏ qua.")
                 return
@@ -305,19 +305,20 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 while attempt < CAPTCHA_MAX_TRIES and not success:
                     attempt += 1
                     try:
-                        img_url = client.fetch_captcha_image_url()
+                        img_url = await asyncio.to_thread(client.fetch_captcha_image_url)
                         if not img_url:
                             last_msg = "Không lấy được captcha."
                             break
-                        img_bytes = client.download_image(img_url)
+                        img_bytes = await asyncio.to_thread(client.download_image, img_url)
 
-                        captcha_answer = solve_captcha_via_2captcha(img_bytes) if USE_2CAPTCHA else None
+                        captcha_answer = await asyncio.to_thread(solve_captcha_via_2captcha, img_bytes) if USE_2CAPTCHA else None
                         if not captcha_answer and USE_2CAPTCHA:
                             last_msg = "2Captcha không trả lời."
                             continue
 
                         if USE_2CAPTCHA and captcha_answer:
-                            result = client.submit_registration(
+                            result = await asyncio.to_thread(
+                                client.submit_registration,
                                 build_payload(id_ngay, target_session["value"], row, captcha_answer)
                             )
                             if "!!!True|~~|" in result:
@@ -370,15 +371,14 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ACTIVE_DAYS.discard(day)
                 COMPLETED_DAYS.add(day)
 
-    # Run per-day threads
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = []
-        for d in days_to_run:
-            futures.append(ex.submit(lambda day=d: context.application.create_task(process_day(day, buckets[day]))))
-        for f in futures:
-            _ = f.result()
+    # Tạo task asyncio cho mỗi ngày (KHÔNG dùng ThreadPoolExecutor)
+    tasks = []
+    for d in days_to_run:
+        tasks.append(context.application.create_task(process_day(d, buckets[d])))
 
-    await update.message.reply_text("Đã khởi chạy các luồng theo ngày. Bot sẽ báo kết quả khi có.")
+    await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
+    # Không await gather để không block handler; nếu muốn đợi xong thì:
+    # await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +412,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     row = data["row"]
 
     try:
-        result = client.submit_registration(build_payload(id_ngay, id_phien, row, text))
+        result = await asyncio.to_thread(
+            client.submit_registration,
+            build_payload(id_ngay, id_phien, row, text)
+        )
         if "!!!True|~~|" in result:
             await update.message.reply_text("✅ Thành công.")
         elif is_session_full(result):
