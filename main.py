@@ -1,3 +1,4 @@
+
 import os
 import io
 import logging
@@ -16,20 +17,25 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("popmart-bot")
 
-BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com/popmart").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com").rstrip("/")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMINS = [x.strip() for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 MAX_WORKERS_CAP = int(os.getenv("MAX_WORKERS", "10"))
 
-# 2Captcha
+# 2Captcha (optional)
 TWO_CAPTCHA_API_KEY = os.getenv("TWO_CAPTCHA_API_KEY", "").strip()
 USE_2CAPTCHA = os.getenv("USE_2CAPTCHA", "0").strip() == "1"
 CAPTCHA_SOFT_TIMEOUT = int(os.getenv("CAPTCHA_SOFT_TIMEOUT", "120"))
 CAPTCHA_POLL_INTERVAL = int(os.getenv("CAPTCHA_POLL_INTERVAL", "5"))
 CAPTCHA_MAX_TRIES = int(os.getenv("CAPTCHA_MAX_TRIES", "4"))
 
-# Pending for manual captcha
+# Anti-dup day registry
+ACTIVE_DAYS = set()
+COMPLETED_DAYS = set()
+ACTIVE_LOCK = threading.Lock()
+
+# Pending manual captcha (if not using 2Captcha)
 PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
 
@@ -39,14 +45,13 @@ class PopmartClient:
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "Mozilla/5.0"
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
         })
         self.timeout = timeout
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def get_main_page(self) -> str:
-        url = f"{self.base_url}/popmart"
-        r = self.session.get(url, timeout=self.timeout)
+        r = self.session.get(f"{self.base_url}/popmart", timeout=self.timeout)
         r.raise_for_status()
         return r.text
 
@@ -56,8 +61,8 @@ class PopmartClient:
         if not sel:
             return None
         for opt in sel.find_all("option"):
-            if (opt.text or '').strip() == target_date:
-                return (opt.get("value") or '').strip()
+            if (opt.text or "").strip() == target_date:
+                return (opt.get("value") or "").strip()
         return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
@@ -68,10 +73,11 @@ class PopmartClient:
         r.raise_for_status()
         html = r.text.split("||@@||")[0]
         soup = BeautifulSoup(html, "html.parser")
-        return [{"value": (opt.get("value") or '').strip(),
-                 "label": (opt.text or '').strip()} for opt in soup.find_all("option")]
+        return [{"value": (opt.get("value") or "").strip(), "label": (opt.text or "").strip()}
+                for opt in soup.find_all("option")]
 
-    def fetch_captcha(self) -> Optional[str]:
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
+    def fetch_captcha_image_url(self) -> Optional[str]:
         r = self.session.get(f"{self.base_url}/Ajax.aspx",
                              params={"Action": "LoadCaptcha"},
                              timeout=self.timeout)
@@ -85,11 +91,13 @@ class PopmartClient:
             return src
         return None
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def download_image(self, url: str) -> bytes:
         r = self.session.get(url, timeout=self.timeout)
         r.raise_for_status()
         return r.content
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def submit_registration(self, payload: Dict[str, str]) -> str:
         r = self.session.get(f"{self.base_url}/Ajax.aspx",
                              params=payload, timeout=self.timeout)
@@ -98,7 +106,7 @@ class PopmartClient:
 
 
 def extract_all_sales_dates(html: str) -> List[str]:
-    out = []
+    out: List[str] = []
     soup = BeautifulSoup(html, "html.parser")
     sel = soup.find("select", {"id": "slNgayBanHang"})
     if not sel:
@@ -106,7 +114,7 @@ def extract_all_sales_dates(html: str) -> List[str]:
     for opt in sel.find_all("option"):
         txt = (opt.text or "").strip()
         val = (opt.get("value") or "").strip()
-        if txt and val:
+        if txt and val:  # skip placeholder
             out.append(txt)
     return out
 
@@ -116,26 +124,42 @@ def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
         return None
     try:
         import time, base64
-        b64 = base64.b64encode(image_bytes).decode()
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        # submit
         r = requests.post("https://2captcha.com/in.php",
                           data={"key": TWO_CAPTCHA_API_KEY, "method": "base64", "body": b64, "json": 1},
                           timeout=REQUEST_TIMEOUT)
-        rid = r.json().get("request")
-        if not rid:
+        r.raise_for_status()
+        j = r.json()
+        if j.get("status") != 1 or "request" not in j:
             return None
+        rid = j["request"]
+        # poll
         end_time = time.time() + CAPTCHA_SOFT_TIMEOUT
         while time.time() < end_time:
             time.sleep(CAPTCHA_POLL_INTERVAL)
             pr = requests.get("https://2captcha.com/res.php",
                               params={"key": TWO_CAPTCHA_API_KEY, "action": "get", "id": rid, "json": 1},
                               timeout=REQUEST_TIMEOUT)
+            pr.raise_for_status()
             jr = pr.json()
             if jr.get("status") == 1:
-                return jr.get("request")
+                return str(jr.get("request", "")).strip()
         return None
     except Exception as e:
         log.warning(f"2Captcha error: {e}")
         return None
+
+
+def is_session_full(text: str) -> bool:
+    t = (text or "").lower()
+    keys = [
+        "đã hết số lượng đăng ký phiên này",
+        "het so luong dang ky phien nay",
+        "this session is full",
+        "session is full",
+    ]
+    return any(k in t for k in keys)
 
 
 def is_admin(uid: int) -> bool:
@@ -162,13 +186,15 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     await update.message.reply_text(
-        "Gửi file Excel (.xlsx) có các cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber."
+        "Gửi file Excel (.xlsx) cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber.\n"
+        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 luồng và xử lý toàn bộ các dòng."
     )
 
 
 async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+
     doc = update.message.document
     if not doc or not doc.file_name.lower().endswith(".xlsx"):
         await update.message.reply_text("Vui lòng gửi file .xlsx")
@@ -176,91 +202,186 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file = await doc.get_file()
     df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()))
-    for col in ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]:
-        if col not in df.columns:
-            await update.message.reply_text(f"Thiếu cột bắt buộc: {col}")
+    required = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]
+    for c in required:
+        if c not in df.columns:
+            await update.message.reply_text(f"Thiếu cột bắt buộc: {c}")
             return
 
     rows = df.to_dict(orient="records")
+    for idx, r in enumerate(rows):
+        r["__row_idx"] = idx
+
     client = PopmartClient(BASE_URL, REQUEST_TIMEOUT)
-    all_days = extract_all_sales_dates(client.get_main_page())
+
+    # Sales dates
+    main_html = client.get_main_page()
+    all_days = extract_all_sales_dates(main_html)
     if not all_days:
         await update.message.reply_text("Không tìm thấy Sales Dates trên form.")
         return
 
-    # Gán round-robin
-    assignments = [(day, rows[i % len(rows)]) for i, day in enumerate(all_days)]
     unique_days = list(dict.fromkeys(all_days))
-    max_workers = min(len(unique_days), MAX_WORKERS_CAP)
-    await update.message.reply_text(f"Tìm thấy {len(unique_days)} ngày. Chạy {max_workers} luồng.")
+    # Anti-dup scheduling
+    days_to_run = []
+    with ACTIVE_LOCK:
+        for d in unique_days:
+            if d in ACTIVE_DAYS or d in COMPLETED_DAYS:
+                continue
+            ACTIVE_DAYS.add(d)
+            days_to_run.append(d)
 
-    buckets: Dict[str, List[Dict[str, Any]]] = {d: [] for d in unique_days}
-    for day, row in assignments:
-        buckets[day].append(row)
+    if not days_to_run:
+        await update.message.reply_text("Không có ngày nào mới để chạy (đã chạy trước đó).")
+        return
+
+    max_workers = min(len(days_to_run), MAX_WORKERS_CAP if MAX_WORKERS_CAP > 0 else len(days_to_run))
+    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Chạy tối đa {max_workers} luồng (mỗi ngày 1 luồng).")
+
+    # Each day -> all rows
+    buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
 
     async def process_day(day: str, tasks: List[Dict[str, Any]]):
         try:
-            id_ngay = client.map_sales_date_to_id(client.get_main_page(), day)
+            html = client.get_main_page()
+            id_ngay = client.map_sales_date_to_id(html, day)
             if not id_ngay:
                 await update.message.reply_text(f"[{day}] Không tìm thấy idNgàyBanHang.")
                 return
+
             sessions = client.load_sessions_for_day(id_ngay)
             if not sessions:
-                await update.message.reply_text(f"[{day}] Không có phiên để đăng ký.")
+                await update.message.reply_text(f"[{day}] Không có phiên để đăng ký. Bỏ qua.")
                 return
-            target_session = sessions[0]  # Luôn chọn phiên đầu tiên
+
+            target_session = sessions[0]  # always pick first
 
             for row in tasks:
                 attempt = 0
-                while attempt < CAPTCHA_MAX_TRIES:
+                success = False
+                last_msg = ""
+
+                while attempt < CAPTCHA_MAX_TRIES and not success:
                     attempt += 1
-                    img_url = client.fetch_captcha()
-                    if not img_url:
-                        await update.message.reply_text(f"[{day}] Không lấy được captcha.")
-                        break
-                    img_bytes = client.download_image(img_url)
-                    captcha_answer = solve_captcha_via_2captcha(img_bytes) if USE_2CAPTCHA else None
-                    if not captcha_answer:
-                        await update.message.reply_photo(img_bytes, caption=f"[{day}] Nhập captcha:")
-                        return
-                    result = client.submit_registration(build_payload(id_ngay, target_session["value"], row, captcha_answer))
-                    if "!!!True|~~|" in result:
-                        await update.message.reply_text(f"✅ {day} — Thành công sau {attempt} lần thử.")
-                        break
-                    elif "Captcha" in result:
+                    try:
+                        img_url = client.fetch_captcha_image_url()
+                        if not img_url:
+                            last_msg = "Không lấy được captcha."
+                            break
+                        img_bytes = client.download_image(img_url)
+
+                        captcha_answer = solve_captcha_via_2captcha(img_bytes) if USE_2CAPTCHA else None
+                        if not captcha_answer and USE_2CAPTCHA:
+                            last_msg = "2Captcha không trả lời."
+                            continue
+
+                        if USE_2CAPTCHA and captcha_answer:
+                            result = client.submit_registration(
+                                build_payload(id_ngay, target_session["value"], row, captcha_answer)
+                            )
+                            if "!!!True|~~|" in result:
+                                await update.message.reply_text(
+                                    f"✅ [{day}] Dòng {row['__row_idx'] + 1} — Thành công sau {attempt}/{CAPTCHA_MAX_TRIES}."
+                                )
+                                success = True
+                                break
+                            elif is_session_full(result):
+                                await update.message.reply_text(
+                                    f"⛔ [{day}] Phiên đã hết lượt. Kết thúc xử lý ngày này."
+                                )
+                                # stop processing remaining rows for this day
+                                return
+                            elif "captcha" in result.lower():
+                                last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
+                                continue
+                            else:
+                                last_msg = f"Không thành công: {result[:200]}"
+                                break
+                        else:
+                            # manual mode
+                            key = f"{update.effective_chat.id}:{day}:{row['__row_idx']}"
+                            with PENDING_LOCK:
+                                PENDING_CAPTCHAS[key] = {
+                                    "client": client,
+                                    "id_ngay": id_ngay,
+                                    "id_phien": target_session["value"],
+                                    "row": row,
+                                }
+                            await update.message.reply_photo(
+                                photo=img_bytes,
+                                caption=f"[{day}] Dòng {row['__row_idx'] + 1}: Vui lòng trả lời tin nhắn này bằng **mã captcha**.",
+                                parse_mode="MarkdownV2",
+                            )
+                            last_msg = "Chuyển sang nhập tay."
+                            break
+                    except Exception as e:
+                        last_msg = f"Lỗi attempt {attempt}: {e}"
                         continue
-                    else:
-                        await update.message.reply_text(f"[{day}] Thất bại: {result[:100]}")
-                        break
+
+                if not success and USE_2CAPTCHA:
+                    await update.message.reply_text(
+                        f"⏭️ [{day}] Dòng {row['__row_idx'] + 1} — Bỏ qua sau {CAPTCHA_MAX_TRIES} lần thử. {last_msg}"
+                    )
+
         except Exception as e:
             await update.message.reply_text(f"[{day}] Lỗi: {e}")
+        finally:
+            with ACTIVE_LOCK:
+                ACTIVE_DAYS.discard(day)
+                COMPLETED_DAYS.add(day)
 
+    # Run per-day threads
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for d in unique_days:
-            ex.submit(lambda day=d: context.application.create_task(process_day(day, buckets[day])))
+        futures = []
+        for d in days_to_run:
+            futures.append(ex.submit(lambda day=d: context.application.create_task(process_day(day, buckets[day]))))
+        for f in futures:
+            _ = f.result()
 
+    await update.message.reply_text("Đã khởi chạy các luồng theo ngày. Bot sẽ báo kết quả khi có.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual captcha answer when not using 2Captcha."""
     if not is_admin(update.effective_user.id):
         return
+    if not update.message or not update.message.text:
+        return
+
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    key = next((k for k in PENDING_CAPTCHAS if k.startswith(f"{chat_id}:")), None)
+    key = None
+    with PENDING_LOCK:
+        for k in list(PENDING_CAPTCHAS.keys()):
+            if k.startswith(f"{chat_id}:"):
+                key = k
+                break
     if not key:
         return
-    data = PENDING_CAPTCHAS.pop(key, None)
+
+    data = None
+    with PENDING_LOCK:
+        data = PENDING_CAPTCHAS.pop(key, None)
     if not data:
+        await update.message.reply_text("Không tìm thấy tác vụ captcha tương ứng.")
         return
-    client = data["client"]
-    payload = build_payload(data["id_ngay"], data["id_phien"], data["row"], text)
+
+    client: PopmartClient = data["client"]
+    id_ngay = data["id_ngay"]
+    id_phien = data["id_phien"]
+    row = data["row"]
+
     try:
-        result = client.submit_registration(payload)
+        result = client.submit_registration(build_payload(id_ngay, id_phien, row, text))
         if "!!!True|~~|" in result:
             await update.message.reply_text("✅ Thành công.")
+        elif is_session_full(result):
+            await update.message.reply_text("⛔ Phiên đã hết lượt. Kết thúc xử lý ngày này.")
+        elif "captcha" in result.lower():
+            await update.message.reply_text("❌ Sai captcha. Dùng /start và gửi lại file để thử lại.")
         else:
-            await update.message.reply_text(f"❌ Thất bại: {result[:100]}")
+            await update.message.reply_text(f"⚠️ Không thành công: {result[:200]}")
     except Exception as e:
-        await update.message.reply_text(f"Lỗi: {e}")
+        await update.message.reply_text(f"❌ Lỗi: {e}")
 
 
 def main():
