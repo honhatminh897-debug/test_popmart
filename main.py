@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import asyncio
 import logging
 import threading
@@ -51,6 +52,7 @@ def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
       - page_url: URL trang form (…/popmart)
       - ajax_url: URL Ajax ở "root" (…/Ajax.aspx)
       - ajax_alt_url: Ajax fallback nằm cùng thư mục với page (…/popmart/Ajax.aspx)
+      - root_base_url: origin + thư mục cha của page (để gọi /DangKy.aspx/GenQRImage)
     """
     sp = urlsplit(base_url)
     base_path = sp.path.rstrip("/")
@@ -59,12 +61,11 @@ def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
     ajax_path = "/" + ajax_path.lstrip("/")
 
     ends_with_pop = base_path.endswith(pop_path)
-    # path của page
     page_path = base_path if ends_with_pop else (base_path + pop_path)
     if not page_path.startswith("/"):
         page_path = "/" + page_path
 
-    # root_path (thư mục cha của page)
+    # thư mục cha của page (root của app)
     root_path = base_path[:-len(pop_path)] if ends_with_pop else base_path
     if not root_path:
         root_path = "/"
@@ -75,20 +76,25 @@ def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
     ajax_url = urlunsplit((sp.scheme, sp.netloc, (root_path.rstrip("/") + ajax_path), "", ""))
     page_dir = page_path.rsplit("/", 1)[0] or "/"
     ajax_alt_url = urlunsplit((sp.scheme, sp.netloc, (page_dir + ajax_path), "", ""))
+    root_base_url = urlunsplit((sp.scheme, sp.netloc, root_path if root_path else "/", "", ""))
 
-    return page_url, ajax_url, ajax_alt_url
+    return page_url, ajax_url, ajax_alt_url, root_base_url
 
 
 class PopmartClient:
     def __init__(self, base_url: str, pop_path: str, ajax_path: str, timeout: int = 30):
         self.base_url = base_url
-        self.page_url, self.ajax_url, self.ajax_alt_url = _normalize_endpoints(base_url, pop_path, ajax_path)
+        (self.page_url,
+         self.ajax_url,
+         self.ajax_alt_url,
+         self.root_base_url) = _normalize_endpoints(base_url, pop_path, ajax_path)
+
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
         })
         self.timeout = timeout
-        log.info(f"[ENDPOINTS] page_url={self.page_url} | ajax_url={self.ajax_url} | ajax_alt_url={self.ajax_alt_url}")
+        log.info(f"[ENDPOINTS] page={self.page_url} | ajax={self.ajax_url} | ajax_alt={self.ajax_alt_url} | root={self.root_base_url}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def get_main_page(self) -> str:
@@ -137,6 +143,26 @@ class PopmartClient:
         r = self._ajax_get(payload)
         return r.text.strip()
 
+    # --- Extra endpoints to mirror real site ---
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
+    def gen_qr_image(self, value: str, text: str) -> Optional[str]:
+        """
+        POST JSON: {"GiaTri":"<MaThamDu>", "NoiDungHienBenDuoi":"<MaThamDu>"}
+        to /DangKy.aspx/GenQRImage -> returns {"d":"<url_png>"}
+        """
+        url = f"{self.root_base_url.rstrip('/')}/DangKy.aspx/GenQRImage"
+        headers = {"Content-Type": "application/json; charset=utf-8"}
+        data = json.dumps({"GiaTri": value, "NoiDungHienBenDuoi": text})
+        r = self.session.post(url, data=data, headers=headers, timeout=self.timeout)
+        r.raise_for_status()
+        jr = r.json()
+        return jr.get("d")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
+    def send_email(self, id_phien: str, ma_tham_du: str) -> bool:
+        r = self._ajax_get({"Action": "SendEmail", "idPhien": id_phien, "MaThamDu": ma_tham_du})
+        return r.text.strip().lower() == "true"
+
     def map_sales_date_to_id(self, html: str, target_date: str) -> Optional[str]:
         soup = BeautifulSoup(html, "html.parser")
         sel = soup.find("select", {"id": "slNgayBanHang"})
@@ -157,7 +183,7 @@ def extract_all_sales_dates(html: str) -> List[str]:
     for opt in sel.find_all("option"):
         txt = (opt.text or "").strip()
         val = (opt.get("value") or "").strip()
-        if txt and val:
+        if txt and val:  # skip placeholder
             out.append(txt)
     return out
 
@@ -228,7 +254,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Gửi file Excel (.xlsx) cột: FullName, DOB_Day, DOB_Month, DOB_Year, Phone, Email, IDNumber.\n"
-        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 luồng và xử lý toàn bộ các dòng."
+        "Bot tự lấy mọi Sales Dates & chọn session đầu tiên. Mỗi ngày chạy 1 task và xử lý toàn bộ các dòng."
     )
 
 
@@ -276,8 +302,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Không có ngày nào mới để chạy (đã chạy trước đó).")
         return
 
-    max_workers = min(len(days_to_run), MAX_WORKERS_CAP if MAX_WORKERS_CAP > 0 else len(days_to_run))
-    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Sẽ tạo {max_workers} task (mỗi ngày 1 task).")
+    await update.message.reply_text(f"Tìm thấy {len(days_to_run)} ngày. Sẽ tạo {len(days_to_run)} task (mỗi ngày 1 task).")
 
     # Each day -> all rows
     buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
@@ -322,9 +347,28 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 build_payload(id_ngay, target_session["value"], row, captcha_answer)
                             )
                             if "!!!True|~~|" in result:
-                                await update.message.reply_text(
-                                    f"✅ [{day}] Dòng {row['__row_idx'] + 1} — Thành công sau {attempt}/{CAPTCHA_MAX_TRIES}."
-                                )
+                                # Parse MaThamDu + HTML xác nhận
+                                arr = result.split("|~~|")
+                                ma = arr[3].strip() if len(arr) > 3 else ""
+                                # Gen QR
+                                qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
+                                qr_bytes = None
+                                if qr_url:
+                                    try:
+                                        qr_bytes = await asyncio.to_thread(client.download_image, qr_url)
+                                    except Exception:
+                                        qr_bytes = None
+                                # Gửi về Telegram
+                                cap = f"✅ [{day}] Dòng {row['__row_idx'] + 1}\nMã tham dự: `{ma}`\nPhiên: {target_session['label']} ({target_session['value']})"
+                                if qr_bytes:
+                                    await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
+                                else:
+                                    await update.message.reply_text(cap)
+                                # SendEmail (best-effort)
+                                try:
+                                    _ = await asyncio.to_thread(client.send_email, target_session["value"], ma)
+                                except Exception:
+                                    pass
                                 success = True
                                 break
                             elif is_session_full(result):
@@ -371,14 +415,9 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ACTIVE_DAYS.discard(day)
                 COMPLETED_DAYS.add(day)
 
-    # Tạo task asyncio cho mỗi ngày (KHÔNG dùng ThreadPoolExecutor)
-    tasks = []
-    for d in days_to_run:
-        tasks.append(context.application.create_task(process_day(d, buckets[d])))
-
+    # tạo task asyncio cho mỗi ngày
+    tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
     await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
-    # Không await gather để không block handler; nếu muốn đợi xong thì:
-    # await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -417,7 +456,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             build_payload(id_ngay, id_phien, row, text)
         )
         if "!!!True|~~|" in result:
-            await update.message.reply_text("✅ Thành công.")
+            arr = result.split("|~~|")
+            ma = arr[3].strip() if len(arr) > 3 else ""
+            qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
+            qr_bytes = None
+            if qr_url:
+                try:
+                    qr_bytes = await asyncio.to_thread(client.download_image, qr_url)
+                except Exception:
+                    qr_bytes = None
+            cap = f"✅ Thành công.\nMã tham dự: `{ma}`"
+            if qr_bytes:
+                await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(cap)
+            try:
+                _ = await asyncio.to_thread(client.send_email, id_phien, ma)
+            except Exception:
+                pass
         elif is_session_full(result):
             await update.message.reply_text("⛔ Phiên đã hết lượt. Kết thúc xử lý ngày này.")
         elif "captcha" in result.lower():
