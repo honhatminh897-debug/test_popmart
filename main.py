@@ -16,7 +16,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("popmart-bot")
 
-BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com/popmart").rstrip("/")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMINS = [x.strip() for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
