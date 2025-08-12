@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import threading
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
@@ -273,10 +274,13 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file = await doc.get_file()
     df = pd.read_excel(io.BytesIO(await file.download_as_bytearray()))
     required = ["FullName", "DOB_Day", "DOB_Month", "DOB_Year", "Phone", "Email", "IDNumber"]
-    for c in required:
-        if c not in df.columns:
-            await update.message.reply_text(f"Thiếu cột bắt buộc: {c}")
-            return
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        await update.message.reply_text(
+            "❌ File thiếu cột bắt buộc: " + ", ".join(missing) +
+            "\nCần đủ: " + ", ".join(required)
+        )
+        return
 
     rows = df.to_dict(orient="records")
     for idx, r in enumerate(rows):
@@ -311,6 +315,12 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Each day -> all rows
     buckets: Dict[str, List[Dict[str, Any]]] = {d: list(rows) for d in days_to_run}
+    report_rows: List[Dict[str, Any]] = []
+    report_lock = asyncio.Lock()
+
+    async def add_report(**kw):
+        async with report_lock:
+            report_rows.append(kw)
 
     async def process_day(day: str, tasks: List[Dict[str, Any]]):
         try:
@@ -318,16 +328,36 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             id_ngay = client.map_sales_date_to_id(html, day)
             if not id_ngay:
                 await update.message.reply_text(f"[{day}] Không tìm thấy idNgàyBanHang.")
+                for row in tasks:
+                    await add_report(
+                        Day=day, DayId="", SessionValue="", SessionLabel="",
+                        Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                        DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                        Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                        Status="Failed", Attempts=0, Message="Không tìm thấy idNgàyBanHang",
+                        MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                    )
                 return
 
             sessions = await asyncio.to_thread(client.load_sessions_for_day, id_ngay)
             if not sessions:
                 await update.message.reply_text(f"[{day}] Không có phiên để đăng ký. Bỏ qua.")
+                for row in tasks:
+                    await add_report(
+                        Day=day, DayId=id_ngay, SessionValue="", SessionLabel="",
+                        Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                        DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                        Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                        Status="Skipped", Attempts=0, Message="Không có phiên",
+                        MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                    )
                 return
 
             target_session = sessions[0]  # always pick first
+            sid = target_session["value"]
+            slabel = target_session["label"]
 
-            for row in tasks:
+            for idx_row, row in enumerate(tasks):
                 attempt = 0
                 success = False
                 last_msg = ""
@@ -349,7 +379,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if USE_2CAPTCHA and captcha_answer:
                             result = await asyncio.to_thread(
                                 client.submit_registration,
-                                build_payload(id_ngay, target_session["value"], row, captcha_answer)
+                                build_payload(id_ngay, sid, row, captcha_answer)
                             )
                             if "!!!True|~~|" in result:
                                 # Parse MaThamDu + HTML xác nhận
@@ -357,29 +387,61 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 ma = arr[3].strip() if len(arr) > 3 else ""
                                 # Gen QR
                                 qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
+                                qr_abs = ""
                                 qr_bytes = None
                                 if qr_url:
+                                    qr_abs = qr_url if qr_url.startswith("http") else f"{client.root_base_url.rstrip('/')}{qr_url}"
                                     try:
-                                        qr_bytes = await asyncio.to_thread(client.download_image, qr_url)
+                                        qr_bytes = await asyncio.to_thread(client.download_image, qr_abs)
                                     except Exception:
                                         qr_bytes = None
                                 # Gửi về Telegram
-                                cap = f"✅ [{day}] Dòng {row['__row_idx'] + 1}\nMã tham dự: `{ma}`\nPhiên: {target_session['label']} ({target_session['value']})"
+                                cap = (
+                                    f"✅ [{day}] Dòng {row['__row_idx'] + 1}\n"
+                                    f"Mã tham dự: `{ma}`\nPhiên: {slabel} ({sid})"
+                                )
                                 if qr_bytes:
                                     await update.message.reply_photo(photo=qr_bytes, caption=cap, parse_mode="Markdown")
                                 else:
                                     await update.message.reply_text(cap)
                                 # SendEmail (best-effort)
                                 try:
-                                    _ = await asyncio.to_thread(client.send_email, target_session["value"], ma)
+                                    _ = await asyncio.to_thread(client.send_email, sid, ma)
                                 except Exception:
                                     pass
                                 success = True
+                                await add_report(
+                                    Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                                    Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                                    DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                                    Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                                    Status="Success", Attempts=attempt, Message="OK",
+                                    MaThamDu=ma, QrUrl=qr_abs, Timestamp=datetime.now().isoformat(timespec="seconds"),
+                                )
                                 break
                             elif is_session_full(result):
                                 await update.message.reply_text(
                                     f"⛔ [{day}] Phiên đã hết lượt. Kết thúc xử lý ngày này."
                                 )
+                                # mark current row as skipped-full
+                                await add_report(
+                                    Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                                    Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                                    DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                                    Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                                    Status="Skipped", Attempts=attempt, Message="Session full",
+                                    MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                                )
+                                # mark remaining rows as skipped-full
+                                for row2 in tasks[idx_row + 1:]:
+                                    await add_report(
+                                        Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                                        Row=row2["__row_idx"] + 1, FullName=row2["FullName"],
+                                        DOB_Day=row2["DOB_Day"], DOB_Month=row2["DOB_Month"], DOB_Year=row2["DOB_Year"],
+                                        Phone=row2["Phone"], Email=row2["Email"], IDNumber=row2["IDNumber"],
+                                        Status="Skipped", Attempts=0, Message="Session full",
+                                        MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                                    )
                                 return  # stop processing remaining rows for this day
                             elif "captcha" in result.lower():
                                 last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
@@ -394,8 +456,13 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 PENDING_CAPTCHAS[key] = {
                                     "client": client,
                                     "id_ngay": id_ngay,
-                                    "id_phien": target_session["value"],
+                                    "id_phien": sid,
                                     "row": row,
+                                    "meta": {
+                                        "Day": day, "DayId": id_ngay, "SessionValue": sid, "SessionLabel": slabel
+                                    },
+                                    "report_list": report_rows,
+                                    "report_lock": report_lock,
                                 }
                             await update.message.reply_photo(
                                 photo=img_bytes,
@@ -412,6 +479,14 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         f"⏭️ [{day}] Dòng {row['__row_idx'] + 1} — Bỏ qua sau {CAPTCHA_MAX_TRIES} lần thử. {last_msg}"
                     )
+                    await add_report(
+                        Day=day, DayId=id_ngay, SessionValue=sid, SessionLabel=slabel,
+                        Row=row["__row_idx"] + 1, FullName=row["FullName"],
+                        DOB_Day=row["DOB_Day"], DOB_Month=row["DOB_Month"], DOB_Year=row["DOB_Year"],
+                        Phone=row["Phone"], Email=row["Email"], IDNumber=row["IDNumber"],
+                        Status="Failed", Attempts=attempt, Message=last_msg or "Max attempts",
+                        MaThamDu="", QrUrl="", Timestamp=datetime.now().isoformat(timespec="seconds"),
+                    )
 
         except Exception as e:
             await update.message.reply_text(f"[{day}] Lỗi: {e}")
@@ -422,9 +497,57 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not DISABLE_GLOBAL_DAY_DEDUP:
                     COMPLETED_DAYS.add(day)
 
-    # tạo task asyncio cho mỗi ngày
+    # tạo task asyncio cho mỗi ngày và đợi hoàn tất để xuất báo cáo
     tasks = [context.application.create_task(process_day(d, buckets[d])) for d in days_to_run]
     await update.message.reply_text("Đã khởi chạy các task theo ngày. Bot sẽ báo kết quả khi có.")
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Tổng hợp & xuất báo cáo
+    if not report_rows:
+        await update.message.reply_text("Không có dữ liệu báo cáo (có thể tất cả bị chặn trước khi chạy).")
+        return
+
+    df = pd.DataFrame(report_rows)
+    # sắp xếp gọn
+    sort_cols = [c for c in ["Day", "Row"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols, kind="stable")
+
+    total = len(df)
+    succ = int((df["Status"] == "Success").sum())
+    fail = int((df["Status"] == "Failed").sum())
+    skip = int((df["Status"] == "Skipped").sum())
+    summary = f"✅ Hoàn tất.\nTổng dòng: {total} — Thành công: {succ} • Thất bại: {fail} • Bỏ qua: {skip}"
+
+    # tạo file Excel (fallback CSV nếu thiếu engine)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    xlsx_name = f"popmart_report_{ts}.xlsx"
+    out = io.BytesIO()
+    wrote = False
+    try:
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Report")
+        wrote = True
+    except Exception:
+        try:
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+                df.to_excel(writer, index=False, sheet_name="Report")
+            wrote = True
+        except Exception:
+            wrote = False
+
+    if wrote:
+        out.seek(0)
+        await update.message.reply_document(document=out, filename=xlsx_name, caption=summary)
+    else:
+        # fallback CSV
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        await update.message.reply_document(
+            document=io.BytesIO(csv_bytes),
+            filename=f"popmart_report_{ts}.csv",
+            caption=summary
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -456,6 +579,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     id_ngay = data["id_ngay"]
     id_phien = data["id_phien"]
     row = data["row"]
+    meta = data.get("meta", {})
+    report_list = data.get("report_list")
+    report_lock: asyncio.Lock = data.get("report_lock")  # type: ignore
 
     try:
         result = await asyncio.to_thread(
@@ -466,10 +592,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             arr = result.split("|~~|")
             ma = arr[3].strip() if len(arr) > 3 else ""
             qr_url = await asyncio.to_thread(client.gen_qr_image, ma, ma)
+            qr_abs = qr_url if (qr_url and qr_url.startswith("http")) else (f"{client.root_base_url.rstrip('/')}{qr_url}" if qr_url else "")
             qr_bytes = None
-            if qr_url:
+            if qr_abs:
                 try:
-                    qr_bytes = await asyncio.to_thread(client.download_image, qr_url)
+                    qr_bytes = await asyncio.to_thread(client.download_image, qr_abs)
                 except Exception:
                     qr_bytes = None
             cap = f"✅ Thành công.\nMã tham dự: `{ma}`"
@@ -481,12 +608,101 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _ = await asyncio.to_thread(client.send_email, id_phien, ma)
             except Exception:
                 pass
+
+            if report_list is not None and report_lock is not None:
+                async with report_lock:
+                    report_list.append({
+                        "Day": meta.get("Day", ""),
+                        "DayId": meta.get("DayId", ""),
+                        "SessionValue": meta.get("SessionValue", ""),
+                        "SessionLabel": meta.get("SessionLabel", ""),
+                        "Row": row["__row_idx"] + 1,
+                        "FullName": row["FullName"],
+                        "DOB_Day": row["DOB_Day"],
+                        "DOB_Month": row["DOB_Month"],
+                        "DOB_Year": row["DOB_Year"],
+                        "Phone": row["Phone"],
+                        "Email": row["Email"],
+                        "IDNumber": row["IDNumber"],
+                        "Status": "Success",
+                        "Attempts": 1,
+                        "Message": "OK (manual captcha)",
+                        "MaThamDu": ma,
+                        "QrUrl": qr_abs,
+                        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
         elif is_session_full(result):
-            await update.message.reply_text("⛔ Phiên đã hết lượt. Kết thúc xử lý ngày này.")
+            await update.message.reply_text("⛔ Phiên đã hết lượt.")
+            if report_list is not None and report_lock is not None:
+                async with report_lock:
+                    report_list.append({
+                        "Day": meta.get("Day", ""),
+                        "DayId": meta.get("DayId", ""),
+                        "SessionValue": meta.get("SessionValue", ""),
+                        "SessionLabel": meta.get("SessionLabel", ""),
+                        "Row": row["__row_idx"] + 1,
+                        "FullName": row["FullName"],
+                        "DOB_Day": row["DOB_Day"],
+                        "DOB_Month": row["DOB_Month"],
+                        "DOB_Year": row["DOB_Year"],
+                        "Phone": row["Phone"],
+                        "Email": row["Email"],
+                        "IDNumber": row["IDNumber"],
+                        "Status": "Skipped",
+                        "Attempts": 1,
+                        "Message": "Session full (manual)",
+                        "MaThamDu": "",
+                        "QrUrl": "",
+                        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
         elif "captcha" in result.lower():
-            await update.message.reply_text("❌ Sai captcha. Dùng /start và gửi lại file để thử lại.")
+            await update.message.reply_text("❌ Sai captcha. Gửi lại mã hoặc /start để gửi file mới.")
+            if report_list is not None and report_lock is not None:
+                async with report_lock:
+                    report_list.append({
+                        "Day": meta.get("Day", ""),
+                        "DayId": meta.get("DayId", ""),
+                        "SessionValue": meta.get("SessionValue", ""),
+                        "SessionLabel": meta.get("SessionLabel", ""),
+                        "Row": row["__row_idx"] + 1,
+                        "FullName": row["FullName"],
+                        "DOB_Day": row["DOB_Day"],
+                        "DOB_Month": row["DOB_Month"],
+                        "DOB_Year": row["DOB_Year"],
+                        "Phone": row["Phone"],
+                        "Email": row["Email"],
+                        "IDNumber": row["IDNumber"],
+                        "Status": "Failed",
+                        "Attempts": 1,
+                        "Message": "Sai captcha (manual)",
+                        "MaThamDu": "",
+                        "QrUrl": "",
+                        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
         else:
             await update.message.reply_text(f"⚠️ Không thành công: {result[:200]}")
+            if report_list is not None and report_lock is not None:
+                async with report_lock:
+                    report_list.append({
+                        "Day": meta.get("Day", ""),
+                        "DayId": meta.get("DayId", ""),
+                        "SessionValue": meta.get("SessionValue", ""),
+                        "SessionLabel": meta.get("SessionLabel", ""),
+                        "Row": row["__row_idx"] + 1,
+                        "FullName": row["FullName"],
+                        "DOB_Day": row["DOB_Day"],
+                        "DOB_Month": row["DOB_Month"],
+                        "DOB_Year": row["DOB_Year"],
+                        "Phone": row["Phone"],
+                        "Email": row["Email"],
+                        "IDNumber": row["IDNumber"],
+                        "Status": "Failed",
+                        "Attempts": 1,
+                        "Message": (result or "")[:200],
+                        "MaThamDu": "",
+                        "QrUrl": "",
+                        "Timestamp": datetime.now().isoformat(timespec="seconds"),
+                    })
     except Exception as e:
         await update.message.reply_text(f"❌ Lỗi: {e}")
 
