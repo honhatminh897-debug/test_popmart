@@ -1,10 +1,10 @@
-
 import os
 import io
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import requests
@@ -17,7 +17,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("popmart-bot")
 
-BASE_URL = os.getenv("BASE_URL", "https://clone-popmart-production.up.railway.app/popmart").rstrip("/")
+# ===== Config =====
+# 👉 BASE_URL có thể là root (vd https://your-app) hoặc đã kèm đường dẫn (vd https://your-app/popmart)
+BASE_URL = os.getenv("BASE_URL", "https://clone-popmart-production.up.railway.app").rstrip("/")
+POP_PAGE_PATH = os.getenv("POP_PAGE_PATH", "/popmart").strip() or "/popmart"
+AJAX_PATH = os.getenv("AJAX_PATH", "/Ajax.aspx").strip() or "/Ajax.aspx"
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMINS = [x.strip() for x in os.getenv("ADMINS", "").split(",") if x.strip()]
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
@@ -40,37 +45,68 @@ PENDING_CAPTCHAS: Dict[str, Dict[str, Any]] = {}
 PENDING_LOCK = threading.Lock()
 
 
+def _normalize_endpoints(base_url: str, pop_path: str, ajax_path: str):
+    """
+    Từ BASE_URL (root hoặc đã kèm /popmart) => tính:
+      - page_url: URL trang form (/popmart)
+      - ajax_url: URL Ajax "chuẩn" ở root (/Ajax.aspx)
+      - ajax_alt_url: Ajax fallback nằm cùng thư mục với page (/popmart/Ajax.aspx)
+    """
+    sp = urlsplit(base_url)
+    # Chuẩn hóa path
+    base_path = sp.path.rstrip("/")
+    pop_path = "/" + pop_path.lstrip("/")
+    ajax_path = "/" + ajax_path.lstrip("/")
+
+    # Nếu BASE_URL đã kết thúc bằng POP_PAGE_PATH -> coi đó là page_url
+    if base_path.endswith(pop_path):
+        root_path = base_path[: -len(pop_path)] or ""
+        page_url = urlunsplit((sp.scheme, sp.netloc, base_path or "/", "", ""))
+        root_base = urlunsplit((sp.scheme, sp.netloc, root_path or "/", "", ""))
+    else:
+        # BASE_URL là root/subdir, ghép thêm pop path
+        root_base = urlunsplit((sp.scheme, sp.netloc, base_path or "/", "", ""))
+        page_url = urlunsplit((sp.scheme, sp.netloc, (base_path + pop_path) or "/", "", ""))
+
+    ajax_url = urlunsplit((sp.scheme, sp.netloc, (root_base.rstrip("/").split(sp.netloc, 1)[-1] or "/").rstrip("/") + ajax_path, "", "")) \
+        if root_base.startswith(f"{sp.scheme}://{sp.netloc}") else f"{root_base.rstrip('/')}{ajax_path}"
+    # Fallback Ajax cùng thư mục với page
+    page_dir = page_url.rsplit("/", 1)[0]
+    ajax_alt_url = f"{page_dir}{ajax_path}"
+
+    return page_url, ajax_url, ajax_alt_url
+
+
 class PopmartClient:
-    def __init__(self, base_url: str, timeout: int = 30):
+    def __init__(self, base_url: str, pop_path: str, ajax_path: str, timeout: int = 30):
         self.base_url = base_url
+        self.page_url, self.ajax_url, self.ajax_alt_url = _normalize_endpoints(base_url, pop_path, ajax_path)
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
         })
         self.timeout = timeout
+        log.info(f"[ENDPOINTS] page_url={self.page_url} | ajax_url={self.ajax_url} | ajax_alt_url={self.ajax_alt_url}")
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def get_main_page(self) -> str:
-        r = self.session.get(f"{self.base_url}/popmart", timeout=self.timeout)
+        r = self.session.get(self.page_url, timeout=self.timeout)
         r.raise_for_status()
         return r.text
 
-    def map_sales_date_to_id(self, html: str, target_date: str) -> Optional[str]:
-        soup = BeautifulSoup(html, "html.parser")
-        sel = soup.find("select", {"id": "slNgayBanHang"})
-        if not sel:
-            return None
-        for opt in sel.find_all("option"):
-            if (opt.text or "").strip() == target_date:
-                return (opt.get("value") or "").strip()
-        return None
+    def _ajax_get(self, params: Dict[str, str]) -> requests.Response:
+        # Thử ajax_url trước, nếu 404 thì thử ajax_alt_url
+        r = self.session.get(self.ajax_url, params=params, timeout=self.timeout, allow_redirects=True)
+        if r.status_code == 404:
+            r2 = self.session.get(self.ajax_alt_url, params=params, timeout=self.timeout, allow_redirects=True)
+            r2.raise_for_status()
+            return r2
+        r.raise_for_status()
+        return r
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def load_sessions_for_day(self, id_ngay: str) -> List[Dict[str, str]]:
-        r = self.session.get(f"{self.base_url}/Ajax.aspx",
-                             params={"Action": "LoadPhien", "idNgayBanHang": id_ngay},
-                             timeout=self.timeout)
-        r.raise_for_status()
+        r = self._ajax_get({"Action": "LoadPhien", "idNgayBanHang": id_ngay})
         html = r.text.split("||@@||")[0]
         soup = BeautifulSoup(html, "html.parser")
         return [{"value": (opt.get("value") or "").strip(), "label": (opt.text or "").strip()}
@@ -78,17 +114,16 @@ class PopmartClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def fetch_captcha_image_url(self) -> Optional[str]:
-        r = self.session.get(f"{self.base_url}/Ajax.aspx",
-                             params={"Action": "LoadCaptcha"},
-                             timeout=self.timeout)
-        r.raise_for_status()
+        r = self._ajax_get({"Action": "LoadCaptcha"})
         soup = BeautifulSoup(r.text, "html.parser")
         img = soup.find("img")
         if img and img.get("src"):
-            src = img["src"]
-            if not src.startswith("http"):
-                src = f"{self.base_url}/{src.lstrip('./')}"
-            return src
+            src = img["src"].strip()
+            if src.startswith("http"):
+                return src
+            # Ảnh captcha thường là đường dẫn root; ghép với root của ajax_url
+            root = self.ajax_url.rsplit("/", 1)[0]
+            return f"{root}/{src.lstrip('./')}"
         return None
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
@@ -99,10 +134,18 @@ class PopmartClient:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     def submit_registration(self, payload: Dict[str, str]) -> str:
-        r = self.session.get(f"{self.base_url}/Ajax.aspx",
-                             params=payload, timeout=self.timeout)
-        r.raise_for_status()
+        r = self._ajax_get(payload)
         return r.text.strip()
+
+    def map_sales_date_to_id(self, html: str, target_date: str) -> Optional[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        sel = soup.find("select", {"id": "slNgayBanHang"})
+        if not sel:
+            return None
+        for opt in sel.find_all("option"):
+            if (opt.text or "").strip() == target_date:
+                return (opt.get("value") or "").strip()
+        return None
 
 
 def extract_all_sales_dates(html: str) -> List[str]:
@@ -125,7 +168,6 @@ def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
     try:
         import time, base64
         b64 = base64.b64encode(image_bytes).decode("ascii")
-        # submit
         r = requests.post("https://2captcha.com/in.php",
                           data={"key": TWO_CAPTCHA_API_KEY, "method": "base64", "body": b64, "json": 1},
                           timeout=REQUEST_TIMEOUT)
@@ -134,7 +176,6 @@ def solve_captcha_via_2captcha(image_bytes: bytes) -> Optional[str]:
         if j.get("status") != 1 or "request" not in j:
             return None
         rid = j["request"]
-        # poll
         end_time = time.time() + CAPTCHA_SOFT_TIMEOUT
         while time.time() < end_time:
             time.sleep(CAPTCHA_POLL_INTERVAL)
@@ -212,7 +253,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, r in enumerate(rows):
         r["__row_idx"] = idx
 
-    client = PopmartClient(BASE_URL, REQUEST_TIMEOUT)
+    client = PopmartClient(BASE_URL, POP_PAGE_PATH, AJAX_PATH, REQUEST_TIMEOUT)
 
     # Sales dates
     main_html = client.get_main_page()
@@ -289,8 +330,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 await update.message.reply_text(
                                     f"⛔ [{day}] Phiên đã hết lượt. Kết thúc xử lý ngày này."
                                 )
-                                # stop processing remaining rows for this day
-                                return
+                                return  # stop processing remaining rows for this day
                             elif "captcha" in result.lower():
                                 last_msg = f"Sai captcha (thử {attempt}/{CAPTCHA_MAX_TRIES})."
                                 continue
@@ -340,6 +380,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Đã khởi chạy các luồng theo ngày. Bot sẽ báo kết quả khi có.")
 
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manual captcha answer when not using 2Captcha."""
     if not is_admin(update.effective_user.id):
@@ -384,6 +425,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Lỗi: {e}")
 
 
+async def on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled exception", exc_info=context.error)
+    try:
+        if update and update.effective_message:
+            await update.effective_message.reply_text(f"Lỗi nội bộ: {context.error}")
+    except Exception:
+        pass
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN")
@@ -391,6 +441,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_excel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(on_error)
     log.info("Bot started.")
     app.run_polling(close_loop=False)
 
