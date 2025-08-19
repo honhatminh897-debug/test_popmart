@@ -21,7 +21,7 @@ log = logging.getLogger("popmart-bot")
 
 # ===== Config =====
 # BASE_URL có thể là root (vd https://your-app) hoặc đã kèm /popmart (vd https://your-app/popmart)
-BASE_URL = os.getenv("BASE_URL", "https://clone-popmart-production.up.railway.app").rstrip("/")
+BASE_URL = os.getenv("BASE_URL", "https://popmartstt.com").rstrip("/")
 POP_PAGE_PATH = os.getenv("POP_PAGE_PATH", "/popmart").strip() or "/popmart"
 AJAX_PATH = os.getenv("AJAX_PATH", "/Ajax.aspx").strip() or "/Ajax.aspx"
 
